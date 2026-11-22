@@ -53,6 +53,7 @@ use crate::options::r#gen::{DeltaReadOptions, DeltaWriteOptions};
 use crate::options::session_replace_where_constraint_check;
 use crate::physical_plan::planner::{DeltaPhysicalPlanner, DeltaPlannerConfig, PlannerContext};
 use crate::schema::manager::{canonicalize_partition_columns, is_check_constraint_property};
+use crate::schema::mapping::annotate_existing_schema_for_column_mapping;
 use crate::schema::type_widening::alter_column_type as alter_delta_column_type;
 use crate::schema::{
     add_type_widening_metadata, annotate_for_column_mapping, collect_type_changes,
@@ -1158,6 +1159,42 @@ impl DeltaLakeSource {
                 new_metadata = new_metadata.with_description(None);
             }
             new_metadata = new_metadata.remove_config_key(key);
+        }
+
+        // Turning column mapping on for a table that has none must also annotate its
+        // schema, or readers cannot map the columns of the files already written.
+        let column_mapping_mode = new_metadata
+            .configuration()
+            .get("delta.columnMapping.mode")
+            .map(|mode| ColumnMappingMode::try_from(mode.as_str()))
+            .transpose()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+            .unwrap_or(ColumnMappingMode::None);
+        if snapshot.effective_column_mapping_mode() == ColumnMappingMode::None {
+            match column_mapping_mode {
+                ColumnMappingMode::None => {}
+                ColumnMappingMode::Name => {
+                    let schema = new_metadata
+                        .parse_schema()
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                    let (schema, max_column_id) =
+                        annotate_existing_schema_for_column_mapping(&schema)
+                            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                    new_metadata = new_metadata
+                        .with_schema(&schema)
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?
+                        .add_config_key(
+                            "delta.columnMapping.maxColumnId".to_string(),
+                            max_column_id.to_string(),
+                        );
+                }
+                // The files already written carry no field ids to map.
+                ColumnMappingMode::Id => {
+                    return plan_err!(
+                        "[DELTA_UNSUPPORTED_COLUMN_MAPPING_MODE_CHANGE] Changing column mapping mode from 'none' to 'id' is not supported."
+                    );
+                }
+            }
         }
 
         // Derive the desired protocol from the new configuration and merge it with the

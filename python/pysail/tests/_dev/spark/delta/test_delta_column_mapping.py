@@ -847,3 +847,58 @@ def test_nested_resolution_uses_only_the_configured_identity(
     row = spark.read.format("delta").load(str(table_path)).collect()[0]
 
     assert row.details.amount == expected
+
+
+def _column_mapping(field: dict) -> tuple:
+    metadata = field.get("metadata", {})
+    nested = (
+        [_column_mapping(child) for child in field["type"].get("fields", [])] if isinstance(field["type"], dict) else []
+    )
+    return (
+        field["name"],
+        metadata.get("delta.columnMapping.id"),
+        metadata.get("delta.columnMapping.physicalName"),
+        nested,
+    )
+
+
+def test_enable_column_mapping_on_existing_table(spark: SparkSession, tmp_path: Path):
+    table_path = tmp_path / "enable_column_mapping"
+    spark.sql(f"CREATE TABLE enable_cm (id INT, details STRUCT<amount: INT>) USING delta LOCATION '{table_path}'")
+    try:
+        spark.sql("INSERT INTO enable_cm VALUES (1, named_struct('amount', 10)), (2, named_struct('amount', 20))")
+        spark.sql(
+            "ALTER TABLE enable_cm SET TBLPROPERTIES ("
+            "'delta.minReaderVersion' = '2', 'delta.minWriterVersion' = '5', 'delta.columnMapping.mode' = 'name')"
+        )
+
+        metadata = _latest_metadata(table_path)
+        fields = json.loads(metadata["schemaString"])["fields"]
+        # The files already written store the columns under their names, so those are the physical names.
+        assert [_column_mapping(field) for field in fields] == [
+            ("id", 1, "id", []),
+            ("details", 2, "details", [("amount", 3, "amount", [])]),
+        ]
+        assert metadata["configuration"]["delta.columnMapping.maxColumnId"] == "3"
+
+        spark.sql("ALTER TABLE enable_cm RENAME COLUMN details TO info")
+        spark.sql("INSERT INTO enable_cm VALUES (3, named_struct('amount', 30))")
+        rows = spark.sql("SELECT id, info.amount FROM enable_cm ORDER BY id").collect()
+        assert [tuple(row) for row in rows] == [(1, 10), (2, 20), (3, 30)]
+        rows = spark.read.format("delta").load(str(table_path)).orderBy("id").collect()
+        assert [(row.id, row.info.amount) for row in rows] == [(1, 10), (2, 20), (3, 30)]
+    finally:
+        spark.sql("DROP TABLE IF EXISTS enable_cm")
+
+
+def test_enable_column_mapping_id_mode_on_existing_table_is_rejected(spark: SparkSession, tmp_path: Path):
+    table_path = tmp_path / "enable_column_mapping_id"
+    spark.sql(f"CREATE TABLE enable_cm_id (id INT) USING delta LOCATION '{table_path}'")
+    try:
+        spark.sql("INSERT INTO enable_cm_id VALUES (1)")
+        # Existing files carry no field ids, so `id` mode could not find their columns.
+        with pytest.raises(Exception, match="from 'none' to 'id'"):
+            spark.sql("ALTER TABLE enable_cm_id SET TBLPROPERTIES ('delta.columnMapping.mode' = 'id')")
+        assert spark.sql("SELECT * FROM enable_cm_id").collect() == [Row(id=1)]
+    finally:
+        spark.sql("DROP TABLE IF EXISTS enable_cm_id")

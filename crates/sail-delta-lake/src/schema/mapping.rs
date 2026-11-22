@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::spec::{
-    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+    ArrayType, ColumnMetadataKey, DataType, DeltaResult, MapType, MetadataValue, StructField,
+    StructType,
 };
 
 /// Annotate a logical kernel schema with column mapping metadata (id + physicalName)
@@ -18,6 +19,54 @@ pub fn annotate_schema_for_column_mapping(schema: &StructType) -> StructType {
         .map(|f| annotate_field(f, &counter))
         .collect();
     StructType::try_new(annotated_fields).unwrap_or_else(|_| empty_struct_type())
+}
+
+/// Annotate the schema of a table that already has data when column mapping is
+/// enabled on it (`none` to `name`). Ids are assigned as for a new table, but each
+/// physical name is the field's current name, since the existing data files store
+/// the columns under those names. Returns the schema and the largest id assigned.
+pub(crate) fn annotate_existing_schema_for_column_mapping(
+    schema: &StructType,
+) -> DeltaResult<(StructType, i64)> {
+    let annotated = annotate_schema_for_column_mapping(schema);
+    let fields = annotated
+        .fields()
+        .map(physical_name_from_name)
+        .collect::<DeltaResult<Vec<_>>>()?;
+    let schema = StructType::try_new(fields)?;
+    let max_id = compute_max_column_id(&schema);
+    Ok((schema, max_id))
+}
+
+fn physical_name_from_name(field: &StructField) -> DeltaResult<StructField> {
+    let mut field = field.clone().add_metadata([(
+        ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+        MetadataValue::String(field.name().clone()),
+    )]);
+    field.data_type = physical_names_from_names(field.data_type())?;
+    Ok(field)
+}
+
+fn physical_names_from_names(data_type: &DataType) -> DeltaResult<DataType> {
+    Ok(match data_type {
+        DataType::Struct(st) => {
+            let fields = st
+                .fields()
+                .map(physical_name_from_name)
+                .collect::<DeltaResult<Vec<_>>>()?;
+            DataType::Struct(Box::new(StructType::try_new(fields)?))
+        }
+        DataType::Array(at) => DataType::Array(Box::new(ArrayType::new(
+            physical_names_from_names(at.element_type())?,
+            at.contains_null(),
+        ))),
+        DataType::Map(mt) => DataType::Map(Box::new(MapType::new(
+            physical_names_from_names(mt.key_type())?,
+            physical_names_from_names(mt.value_type())?,
+            mt.value_contains_null(),
+        ))),
+        other => other.clone(),
+    })
 }
 
 /// Annotate only new fields (compared to `existing`) within `candidate` with
@@ -286,5 +335,67 @@ mod tests {
             );
             assert!(field.metadata().contains_key("delta.columnMapping.id"));
         }
+    }
+
+    #[test]
+    fn existing_schema_annotation_uses_current_names_as_physical_names() {
+        let element = StructType::try_new(vec![StructField::new("score", DataType::LONG, true)])
+            .expect("element schema");
+        let value = StructType::try_new(vec![StructField::new("note", DataType::STRING, true)])
+            .expect("value schema");
+        let schema = StructType::try_new(vec![
+            StructField::new("id", DataType::LONG, true),
+            StructField::new(
+                "scores",
+                DataType::Array(Box::new(ArrayType::new(
+                    DataType::Struct(Box::new(element)),
+                    true,
+                ))),
+                true,
+            ),
+            StructField::new(
+                "notes",
+                DataType::Map(Box::new(MapType::new(
+                    DataType::STRING,
+                    DataType::Struct(Box::new(value)),
+                    true,
+                ))),
+                true,
+            ),
+        ])
+        .expect("schema");
+
+        let (annotated, max_id) =
+            annotate_existing_schema_for_column_mapping(&schema).expect("annotated schema");
+
+        let id = annotated.field("id").expect("id field");
+        let scores = annotated.field("scores").expect("scores field");
+        let notes = annotated.field("notes").expect("notes field");
+        let DataType::Array(scores_type) = scores.data_type() else {
+            panic!("scores must be an array");
+        };
+        let DataType::Struct(element) = scores_type.element_type() else {
+            panic!("scores elements must be structs");
+        };
+        let DataType::Map(notes_type) = notes.data_type() else {
+            panic!("notes must be a map");
+        };
+        let DataType::Struct(value) = notes_type.value_type() else {
+            panic!("notes values must be structs");
+        };
+        let score = element.field("score").expect("score field");
+        let note = value.field("note").expect("note field");
+
+        let mut ids = Vec::new();
+        for field in [id, scores, score, notes, note] {
+            assert_eq!(
+                column_mapping_physical_name(field),
+                Some(field.name().as_str())
+            );
+            ids.push(column_mapping_id(field).expect("column mapping id"));
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+        assert_eq!(max_id, 5);
     }
 }
